@@ -1,0 +1,18 @@
+[Unit]
+Description=IDS Agent Daemon
+After=network.target
+
+[Service]
+ExecStart=../.venv/bin/python ../agentd/daemon.py
+Restart=always
+User=root
+WorkingDirectory=/opt/ids_agent
+Environment="PYTHONUNBUFFERED=1"
+
+# Logging via systemd journal
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=ids_agent
+
+[Install]
+WantedBy=multi-user.target

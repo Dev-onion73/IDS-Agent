@@ -1,0 +1,12 @@
+
+# YAML parsing for agent configuration
+PyYAML>=6.0
+
+# Pretty-printing/debugging JSON events
+rich>=13.3.0
+
+# Optional: colorized logging for daemon
+colorlog>=6.7.0
+
+# For HTTP requests if Person B later integrates hub POST
+requests>=2.31.0

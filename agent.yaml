@@ -1,0 +1,10 @@
+device_id: "agent-123"
+
+network_monitor:
+  enabled: true
+  ports: [22, 80]
+
+file_monitor:
+  enabled: true
+  paths:
+    - ../test-dir
