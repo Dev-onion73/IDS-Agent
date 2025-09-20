@@ -8,10 +8,11 @@ import yaml
 from client import send_event
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from netfilterqueue import NetfilterQueue
-from scapy.all import IP, TCP, Ether, Raw, conf
 from threading import Thread
-import subprocess
+
+from pyroute2 import IPRoute, IPDB, NetlinkError
+from pyroute2.netlink.rtnl import RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR
+from pyroute2.netlink import NLMSG_DONE
 
 # === Paths & Config ===
 CONFIG_FILE = "agent.yaml"
@@ -55,61 +56,51 @@ class FileEventHandler(FileSystemEventHandler):
         send_event(event_json)
         save_event_locally(event_json)
 
-# === NFQUEUE Network Monitoring ===
-def setup_iptables(queue_num=1):
-    """Add iptables rule to send TCP packets to NFQUEUE."""
-    for port in NETWORK_PORTS:
-        subprocess.run(["sudo", "iptables", "-I", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "NFQUEUE", "--queue-num", str(queue_num)], check=True)
+# === Netlink-based Network Monitoring ===
+def netlink_monitor():
+    """Monitor TCP connection events via Netlink (conntrack events can be used with NFNETLINK_CONNTRACK)."""
+    from pyroute2 import NFNetlinkConntrack
 
-def cleanup_iptables(queue_num=1):
-    """Remove NFQUEUE iptables rules."""
-    for port in NETWORK_PORTS:
-        subprocess.run(["sudo", "iptables", "-D", "INPUT", "-p", "tcp", "--dport", str(port), "-j", "NFQUEUE", "--queue-num", str(queue_num)], check=True)
-
-def handle_nfqueue_packet(packet):
-    """Callback for NFQUEUE packets."""
-    scapy_pkt = IP(packet.get_payload())
-    if TCP in scapy_pkt and scapy_pkt[TCP].dport in NETWORK_PORTS:
-        event_json = {
-            "id": str(uuid.uuid4()),
-            "device_id": DEVICE_ID,
-            "type": "network_event",
-            "details": {
-                "src_ip": scapy_pkt.src,
-                "dst_ip": scapy_pkt.dst,
-                "sport": scapy_pkt[TCP].sport,
-                "dport": scapy_pkt[TCP].dport,
-                "protocol": "TCP",
-                "action": "connect"
-            },
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        }
-        send_event(event_json)
-        save_event_locally(event_json)
-
-    # Accept packet (could drop/modify if needed)
-    packet.accept()
-
-def start_nfqueue_monitor(queue_num=1):
-    """Start NFQUEUE monitoring in a background thread."""
-    setup_iptables(queue_num)
-    nfqueue = NetfilterQueue()
-    nfqueue.bind(queue_num, handle_nfqueue_packet)
+    ct = NFNetlinkConntrack()
+    ct.bind(groups=ct.CTNLGRP_CONNTRACK_NEW | ct.CTNLGRP_CONNTRACK_UPDATE)
     
-    def run_queue():
-        try:
-            nfqueue.run()
-        finally:
-            nfqueue.unbind()
-            cleanup_iptables(queue_num)
-    
-    t = Thread(target=run_queue, daemon=True)
-    t.start()
-    return t
+    try:
+        for msg in ct:
+            # Only track TCP connections
+            try:
+                attrs = dict(msg.get('attrs', []))
+                protoinfo = attrs.get('CTA_PROTOINFO')
+                if not protoinfo:
+                    continue
+                sport = protoinfo.get('sport')
+                dport = protoinfo.get('dport')
+                if NETWORK_PORTS and dport not in NETWORK_PORTS:
+                    continue
+
+                event_json = {
+                    "id": str(uuid.uuid4()),
+                    "device_id": DEVICE_ID,
+                    "type": "network_event",
+                    "details": {
+                        "src_ip": attrs.get('CTA_SRC_IPV4') or attrs.get('CTA_SRC_IPV6'),
+                        "dst_ip": attrs.get('CTA_DST_IPV4') or attrs.get('CTA_DST_IPV6'),
+                        "sport": sport,
+                        "dport": dport,
+                        "protocol": "TCP",
+                        "action": msg.get('event')  # 'new', 'update', 'destroy'
+                    },
+                    "timestamp": datetime.utcnow().isoformat() + "Z"
+                }
+                send_event(event_json)
+                save_event_locally(event_json)
+            except Exception as e:
+                continue
+    finally:
+        ct.close()
 
 # === Main ===
 if __name__ == "__main__":
-    print("Daemon started with Watchdog + NFQUEUE network monitoring.")
+    print("Daemon started with Watchdog + Netlink network monitoring.")
 
     # Setup file observers
     observers = []
@@ -124,10 +115,11 @@ if __name__ == "__main__":
             observer.start()
             observers.append(observer)
 
-    # Setup NFQUEUE network monitor
-    nfqueue_thread = None
+    # Start Netlink network monitor in a background thread
+    netlink_thread = None
     if config.get("network_monitor", {}).get("enabled", False):
-        nfqueue_thread = start_nfqueue_monitor()
+        netlink_thread = Thread(target=netlink_monitor, daemon=True)
+        netlink_thread.start()
 
     try:
         while True:
