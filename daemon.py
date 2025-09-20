@@ -8,11 +8,8 @@ import yaml
 from client import send_event
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+import subprocess
 from threading import Thread
-
-from pyroute2 import IPRoute, IPDB, NetlinkError
-from pyroute2.netlink.rtnl import RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR
-from pyroute2.netlink import NLMSG_DONE
 
 # === Paths & Config ===
 CONFIG_FILE = "agent.yaml"
@@ -26,7 +23,7 @@ with open(CONFIG_FILE) as f:
 
 DEVICE_ID = config.get("device_id", "agent-123")
 FILE_PATHS = config.get("file_monitor", {}).get("paths", [])
-NETWORK_PORTS = config.get("network_monitor", {}).get("ports", [])
+NETWORK_MONITOR_ENABLED = config.get("network_monitor", {}).get("enabled", False)
 
 # === Local storage ===
 def save_event_locally(event_json):
@@ -56,51 +53,36 @@ class FileEventHandler(FileSystemEventHandler):
         send_event(event_json)
         save_event_locally(event_json)
 
-# === Netlink-based Network Monitoring ===
-def netlink_monitor():
-    """Monitor TCP connection events via Netlink (conntrack events can be used with NFNETLINK_CONNTRACK)."""
-    from pyroute2 import NFNetlinkConntrack
+# === Network Monitoring via C program ===
+def monitor_network_c(c_program_path="./ebpf"):
+    """Launch the C network monitor and read JSON events from its stdout."""
+    if not os.path.isfile(c_program_path):
+        print(f"[ERROR] C network monitor not found at {c_program_path}")
+        return
 
-    ct = NFNetlinkConntrack()
-    ct.bind(groups=ct.CTNLGRP_CONNTRACK_NEW | ct.CTNLGRP_CONNTRACK_UPDATE)
-    
-    try:
-        for msg in ct:
-            # Only track TCP connections
-            try:
-                attrs = dict(msg.get('attrs', []))
-                protoinfo = attrs.get('CTA_PROTOINFO')
-                if not protoinfo:
-                    continue
-                sport = protoinfo.get('sport')
-                dport = protoinfo.get('dport')
-                if NETWORK_PORTS and dport not in NETWORK_PORTS:
-                    continue
+    proc = subprocess.Popen(
+        [c_program_path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1  # Line buffered
+    )
 
-                event_json = {
-                    "id": str(uuid.uuid4()),
-                    "device_id": DEVICE_ID,
-                    "type": "network_event",
-                    "details": {
-                        "src_ip": attrs.get('CTA_SRC_IPV4') or attrs.get('CTA_SRC_IPV6'),
-                        "dst_ip": attrs.get('CTA_DST_IPV4') or attrs.get('CTA_DST_IPV6'),
-                        "sport": sport,
-                        "dport": dport,
-                        "protocol": "TCP",
-                        "action": msg.get('event')  # 'new', 'update', 'destroy'
-                    },
-                    "timestamp": datetime.utcnow().isoformat() + "Z"
-                }
-                send_event(event_json)
-                save_event_locally(event_json)
-            except Exception as e:
-                continue
-    finally:
-        ct.close()
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event_json = json.loads(line)
+            event_json["device_id"] = DEVICE_ID  # Add device ID
+            send_event(event_json)
+            save_event_locally(event_json)
+        except json.JSONDecodeError:
+            print(f"[WARNING] Could not decode JSON from C monitor: {line}")
 
 # === Main ===
 if __name__ == "__main__":
-    print("Daemon started with Watchdog + Netlink network monitoring.")
+    print("Daemon started with Watchdog + C network monitoring.")
 
     # Setup file observers
     observers = []
@@ -115,11 +97,11 @@ if __name__ == "__main__":
             observer.start()
             observers.append(observer)
 
-    # Start Netlink network monitor in a background thread
-    netlink_thread = None
-    if config.get("network_monitor", {}).get("enabled", False):
-        netlink_thread = Thread(target=netlink_monitor, daemon=True)
-        netlink_thread.start()
+    # Start C network monitor in a separate thread
+    network_thread = None
+    if NETWORK_MONITOR_ENABLED:
+        network_thread = Thread(target=monitor_network_c, args=("./mon",), daemon=True)
+        network_thread.start()
 
     try:
         while True:
