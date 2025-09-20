@@ -2,12 +2,13 @@
 import os
 import json
 import uuid
+import time
 from datetime import datetime
 import yaml
 from client import send_event
-from bcc import BPF
-import socket
-import struct
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from scapy.all import sniff, TCP, IP
 
 # === Paths & Config ===
 CONFIG_FILE = "agent.yaml"
@@ -23,86 +24,93 @@ DEVICE_ID = config.get("device_id", "agent-123")
 FILE_PATHS = config.get("file_monitor", {}).get("paths", [])
 NETWORK_PORTS = config.get("network_monitor", {}).get("ports", [])
 
-# === Local storage function ===
+# === Local storage ===
 def save_event_locally(event_json):
     filename = FILE_EVENTS_JSON if event_json["type"] == "file_event" else NETWORK_EVENTS_JSON
     with open(filename, "a") as f:
         f.write(json.dumps(event_json) + "\n")
 
-# === Helper to convert IP int to dotted string ===
-def int_to_ip(addr):
-    return socket.inet_ntoa(struct.pack("<I", addr))
+# === File Monitoring ===
+class FileEventHandler(FileSystemEventHandler):
+    def on_any_event(self, event):
+        if event.is_directory:
+            return
+        if FILE_PATHS and not any(event.src_path.startswith(p) for p in FILE_PATHS):
+            return
 
-# === Load eBPF programs ===
-file_bpf = BPF(src_file="ebpf/file_monitor.c")
-network_bpf = BPF(src_file="ebpf/network_monitor.c")
+        event_json = {
+            "device_id": DEVICE_ID,
+            "type": "file_event",
+            "path": event.src_path,
+            "action": event.event_type,
+            "process": "unknown",
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        send_event(event_json)
+        save_event_locally(event_json)
 
-# Attach kprobes
-file_bpf.attach_kprobe(event="sys_openat", fn_name="trace_openat")
-network_bpf.attach_kprobe(event="tcp_v4_connect", fn_name="trace_tcp_connect")
+# === Network Monitoring ===
+def handle_packet(packet):
+    """Event-driven network packet handler via Scapy."""
+    if TCP in packet and packet[TCP].dport in NETWORK_PORTS:
+        event_json = {
+            "id": str(uuid.uuid4()),
+            "device_id": DEVICE_ID,
+            "type": "network_event",
+            "details": {
+                "src_ip": packet[IP].src,
+                "dst_ip": packet[IP].dst,
+                "sport": packet[TCP].sport,
+                "dport": packet[TCP].dport,
+                "protocol": "TCP",
+                "action": "connect"
+            },
+            "timestamp": datetime.utcnow().isoformat() + "Z"
+        }
+        send_event(event_json)
+        save_event_locally(event_json)
 
-# === Callback functions ===
-def handle_file_event(cpu, data, size):
-    event = file_bpf["events"].event(data)
-    file_path = event.filename.decode(errors="ignore")
-
-    # Filter based on configured paths
-    if FILE_PATHS and not any(file_path.startswith(p) for p in FILE_PATHS):
-        return  # Skip unmonitored paths
-
-    event_json = {
-        "id": str(uuid.uuid4()),
-        "device_id": DEVICE_ID,
-        "type": "file_event",
-        "details": {
-            "pid": event.pid,
-            "uid": event.uid,
-            "process": event.comm.decode(errors="ignore"),
-            "path": file_path,
-            "action": "open"
+def start_network_sniffer():
+    """Start Scapy sniffing in the background."""
+    from threading import Thread
+    sniff_thread = Thread(
+        target=sniff,
+        kwargs={
+            "filter": "tcp",
+            "prn": handle_packet,
+            "store": False
         },
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    send_event(event_json)
-    save_event_locally(event_json)
-
-def handle_network_event(cpu, data, size):
-    event = network_bpf["events"].event(data)
-    dport = event.dport
-
-    # Filter based on configured ports
-    if NETWORK_PORTS and dport not in NETWORK_PORTS:
-        return  # Skip unmonitored ports
-
-    event_json = {
-        "id": str(uuid.uuid4()),
-        "device_id": DEVICE_ID,
-        "type": "network_event",
-        "details": {
-            "pid": event.pid,
-            "uid": event.uid,
-            "process": event.comm.decode(errors="ignore"),
-            "src_ip": int_to_ip(event.saddr),
-            "dst_ip": int_to_ip(event.daddr),
-            "dport": dport,
-            "protocol": "TCP",
-            "action": "connect"
-        },
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    send_event(event_json)
-    save_event_locally(event_json)
-
-# === Open perf buffers ===
-file_bpf["events"].open_perf_buffer(handle_file_event)
-network_bpf["events"].open_perf_buffer(handle_network_event)
+        daemon=True
+    )
+    sniff_thread.start()
+    return sniff_thread
 
 # === Main loop ===
 if __name__ == "__main__":
-    print("Daemon started with eBPF monitoring.")
+    print("Daemon started with Watchdog + Scapy monitoring.")
+
+    # Setup file observers
+    observers = []
+    if config.get("file_monitor", {}).get("enabled", False):
+        for path in FILE_PATHS:
+            handler = FileEventHandler()
+            observer = Observer()
+            observer.schedule(handler, path=path, recursive=True)
+            observer.start()
+            observers.append(observer)
+
+    # Setup network sniffer
+    sniff_thread = None
+    if config.get("network_monitor", {}).get("enabled", False):
+        sniff_thread = start_network_sniffer()
+
     try:
+        # Keep main thread alive
         while True:
-            file_bpf.perf_buffer_poll()
-            network_bpf.perf_buffer_poll()
+            time.sleep(1)
     except KeyboardInterrupt:
         print("Daemon stopped.")
+        # Stop file observers
+        for obs in observers:
+            obs.stop()
+            obs.join()
